@@ -99,6 +99,11 @@ python vapt_scanner.py -t example.com -u http://example.com -w
 python vapt_scanner.py -t example.com -u http://example.com -a
 ```
 
+**Full scan with JSON report:**
+```bash
+python vapt_scanner.py -t example.com -u http://example.com -a -o report.json
+```
+
 ## Legal Notice
 
 **FOR EDUCATIONAL AND AUTHORIZED TESTING ONLY**
