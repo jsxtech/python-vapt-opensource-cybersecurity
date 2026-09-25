@@ -74,35 +74,57 @@ chmod +x vapt_scanner.py
 
 ## Usage
 
+> All scans require the `--confirm-authorized` flag to acknowledge you have permission to test the target.
+
 **Port scan:**
 ```bash
-python vapt_scanner.py -t 192.168.1.1 -p
+python vapt_scanner.py -t 192.168.1.1 -p --confirm-authorized
 ```
 
 **SSL check:**
 ```bash
-python vapt_scanner.py -t example.com -s
+python vapt_scanner.py -t example.com -s --confirm-authorized
 ```
 
 **Subdomain enumeration:**
 ```bash
-python vapt_scanner.py -t example.com -d
+python vapt_scanner.py -t example.com -d --confirm-authorized
 ```
 
 **Web vulnerability scan:**
 ```bash
-python vapt_scanner.py -t example.com -u http://example.com -w
+python vapt_scanner.py -t example.com -u http://example.com -w --confirm-authorized
 ```
 
 **Full scan:**
 ```bash
-python vapt_scanner.py -t example.com -u http://example.com -a
+python vapt_scanner.py -t example.com -u http://example.com -a --confirm-authorized
 ```
 
 **Full scan with JSON report:**
 ```bash
-python vapt_scanner.py -t example.com -u http://example.com -a -o report.json
+python vapt_scanner.py -t example.com -u http://example.com -a --confirm-authorized -o report.json
 ```
+
+**Polite scan (0.5s delay between requests):**
+```bash
+python vapt_scanner.py -t example.com -u http://example.com -a --confirm-authorized --delay 0.5
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-t, --target` | Target IP or domain (required) |
+| `-u, --url` | Target URL for web tests |
+| `-p, --ports` | Run port scan |
+| `-s, --ssl` | Check SSL/TLS certificate |
+| `-d, --subdomain` | Enumerate subdomains |
+| `-w, --web` | Run web vulnerability tests |
+| `-a, --all` | Run all tests |
+| `-o, --output` | Write full JSON report to file (captures every executed test) |
+| `--delay` | Seconds to wait between HTTP requests (politeness/rate control) |
+| `--confirm-authorized` | Required acknowledgment that you are authorized to test the target |
 
 ## Legal Notice
 
