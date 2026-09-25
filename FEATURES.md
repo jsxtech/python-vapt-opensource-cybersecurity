@@ -204,8 +204,11 @@ Identifies popular platforms:
 ### 44. Shellshock Vulnerability Test
 - Bash environment variable injection
 
-### 45. Heartbleed Detection
-- TLS version analysis, OpenSSL vulnerability
+### 45. Heartbleed / TLS Posture Check
+- Reports the negotiated TLS protocol version
+- Flags deprecated protocols (SSLv2/3, TLSv1.0/1.1)
+- Note: does not send a live heartbeat probe and cannot confirm server-side
+  Heartbleed (CVE-2014-0160); use a dedicated tool for definitive testing
 
 ### 46. Weak Cipher Detection
 - RC4, DES, MD5, NULL ciphers
@@ -269,15 +272,15 @@ Identifies popular platforms:
 
 ```bash
 # Single feature tests
-python vapt_scanner.py -t example.com -p              # Port scan
-python vapt_scanner.py -t example.com -s              # SSL check
-python vapt_scanner.py -t example.com -d              # Subdomain enum
+python vapt_scanner.py -t example.com -p --confirm-authorized              # Port scan
+python vapt_scanner.py -t example.com -s --confirm-authorized              # SSL check
+python vapt_scanner.py -t example.com -d --confirm-authorized              # Subdomain enum
 
 # Web vulnerability scan
-python vapt_scanner.py -t example.com -u http://example.com -w
+python vapt_scanner.py -t example.com -u http://example.com -w --confirm-authorized
 
-# Comprehensive scan (all 61 tests)
-python vapt_scanner.py -t example.com -u http://example.com -a
+# Comprehensive scan (all tests)
+python vapt_scanner.py -t example.com -u http://example.com -a --confirm-authorized
 ```
 
 ## Command-Line Options
@@ -291,6 +294,9 @@ python vapt_scanner.py -t example.com -u http://example.com -a
 | `-d` | `--subdomain` | Enumerate subdomains |
 | `-w` | `--web` | Run web vulnerability tests |
 | `-a` | `--all` | Run all available tests |
+| `-o` | `--output` | Write full JSON report to file (captures every executed test) |
+|      | `--delay` | Seconds to wait between HTTP requests (politeness/rate control) |
+|      | `--confirm-authorized` | Required acknowledgment that you are authorized to test the target |
 
 ## Output Indicators
 
