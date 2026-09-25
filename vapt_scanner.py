@@ -22,13 +22,63 @@ from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class VAPTScanner:
-    def __init__(self, target):
+    def __init__(self, target, delay=0.0):
         self.target = target
         self.results = {}
+        self.delay = max(0.0, float(delay))
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers.update({'User-Agent': 'VAPT-Scanner/1.0'})
-    
+
+        # Apply the politeness delay to every request made through the session,
+        # regardless of which helper or direct call issues it.
+        if self.delay:
+            _orig_request = self.session.request
+
+            def _throttled_request(method, url, **kwargs):
+                time.sleep(self.delay)
+                return _orig_request(method, url, **kwargs)
+
+            self.session.request = _throttled_request
+
+    def _throttle(self):
+        """Retained for compatibility; session-level throttling is applied in __init__."""
+        return
+
+    def _safe_get(self, url, **kwargs):
+        """Perform a GET request, honoring the politeness delay.
+
+        Returns the Response object, or None on any request error.
+        kwargs are passed through to requests (timeout, headers, etc.).
+        """
+        kwargs.setdefault('timeout', 5)
+        self._throttle()
+        try:
+            return self.session.get(url, **kwargs)
+        except requests.RequestException:
+            return None
+
+    def _safe_post(self, url, **kwargs):
+        """Perform a POST request, honoring the politeness delay.
+
+        Returns the Response object, or None on any request error.
+        """
+        kwargs.setdefault('timeout', 5)
+        self._throttle()
+        try:
+            return self.session.post(url, **kwargs)
+        except requests.RequestException:
+            return None
+
+    def _safe_request(self, method, url, **kwargs):
+        """Perform an arbitrary-method request. Returns Response or None."""
+        kwargs.setdefault('timeout', 5)
+        self._throttle()
+        try:
+            return self.session.request(method, url, **kwargs)
+        except requests.RequestException:
+            return None
+
     def port_scan(self, ports=None):
         """Scan common ports using thread pool"""
         if ports is None:
@@ -476,40 +526,44 @@ class VAPTScanner:
         return False
     
     def jwt_test(self, url):
-        """Test JWT security"""
+        """Test JWT security by inspecting any JWT exposed in cookies.
+
+        Note: servers do not normally send an 'Authorization' response header,
+        so detection relies on JWT-like values found in Set-Cookie.
+        """
         print(f"\n[*] Testing JWT security")
+        resp = self._safe_get(url)
+        if resp is None:
+            print("[+] No JWT issues detected")
+            return False
+
+        jwt_token = None
+        # Iterate cookies correctly: cookie is a Cookie object with .name/.value
+        for cookie in resp.cookies:
+            if 'jwt' in cookie.name.lower() or 'token' in cookie.name.lower():
+                jwt_token = cookie.value
+                break
+
+        if not jwt_token or jwt_token.count('.') != 2:
+            print("[+] No JWT issues detected")
+            return False
+
         try:
-            resp = self.session.get(url, timeout=5)
-            cookies = resp.cookies
-            auth_header = resp.headers.get('Authorization', '')
-            
-            # Check for JWT in cookies or headers
-            jwt_token = None
-            for cookie in cookies:
-                if 'jwt' in cookie.lower() or 'token' in cookie.lower():
-                    jwt_token = cookies[cookie]
-                    break
-            
-            if 'Bearer' in auth_header:
-                jwt_token = auth_header.split('Bearer ')[-1]
-            
-            if jwt_token and jwt_token.count('.') == 2:
-                parts = jwt_token.split('.')
-                # JWT uses base64url encoding - add proper padding
-                padded = parts[0] + '=' * (4 - len(parts[0]) % 4)
-                header = json.loads(base64.urlsafe_b64decode(padded))
-                
-                if header.get('alg') == 'none':
-                    print("[!] JWT uses 'none' algorithm - Critical vulnerability")
-                    return True
-                elif header.get('alg') == 'HS256':
-                    print("[+] JWT uses HS256 (check for weak secrets separately)")
-                
-                print(f"[+] JWT algorithm: {header.get('alg')}")
-        except Exception as e:
-            pass
-        
-        print("[+] No JWT issues detected")
+            parts = jwt_token.split('.')
+            # JWT uses base64url encoding - add proper padding
+            padded = parts[0] + '=' * (-len(parts[0]) % 4)
+            header = json.loads(base64.urlsafe_b64decode(padded))
+        except (ValueError, json.JSONDecodeError):
+            print("[+] No JWT issues detected")
+            return False
+
+        alg = header.get('alg')
+        if alg and alg.lower() == 'none':
+            print("[!] JWT uses 'none' algorithm - Critical vulnerability")
+            self._record('jwt_test', {'vulnerable': True, 'alg': alg})
+            return True
+        print(f"[+] JWT algorithm: {alg}")
+        self._record('jwt_test', {'vulnerable': False, 'alg': alg})
         return False
     
     def http_methods_test(self, url):
@@ -605,29 +659,42 @@ class VAPTScanner:
         return found
     
     def cookie_security_check(self, url):
-        """Check cookie security attributes"""
+        """Check cookie security attributes by parsing raw Set-Cookie headers."""
         print(f"\n[*] Checking cookie security")
-        try:
-            resp = self.session.get(url, timeout=5)
-            cookies = resp.cookies
-            
-            if not cookies:
-                print("[-] No cookies set")
-                return None
-            
-            for cookie in cookies:
-                print(f"\n[*] Cookie: {cookie.name}")
-                if not cookie.secure:
-                    print(f"  [!] Missing Secure flag")
-                if not cookie.has_nonstandard_attr('HttpOnly'):
-                    print(f"  [!] Missing HttpOnly flag")
-                if not cookie.has_nonstandard_attr('SameSite'):
-                    print(f"  [!] Missing SameSite attribute")
-                
-            return True
-        except Exception as e:
-            print(f"[!] Error: {e}")
+        resp = self._safe_get(url)
+        if resp is None:
+            print("[!] Error: request failed")
             return None
+
+        # requests collapses duplicate headers; use raw header list when available
+        raw_cookies = resp.raw.headers.getlist('Set-Cookie') if hasattr(resp.raw, 'headers') else []
+        if not raw_cookies:
+            single = resp.headers.get('Set-Cookie')
+            raw_cookies = [single] if single else []
+
+        if not raw_cookies:
+            print("[-] No cookies set")
+            self._record('cookie_security_check', {'cookies': []})
+            return None
+
+        findings = []
+        for raw in raw_cookies:
+            lower = raw.lower()
+            name = raw.split('=', 1)[0].strip()
+            issues = []
+            if 'secure' not in lower:
+                issues.append('Missing Secure flag')
+            if 'httponly' not in lower:
+                issues.append('Missing HttpOnly flag')
+            if 'samesite' not in lower:
+                issues.append('Missing SameSite attribute')
+            print(f"\n[*] Cookie: {name}")
+            for issue in issues:
+                print(f"  [!] {issue}")
+            findings.append({'name': name, 'issues': issues})
+
+        self._record('cookie_security_check', {'cookies': findings})
+        return findings
     
     def dns_zone_transfer(self, domain):
         """Test for DNS zone transfer vulnerability"""
@@ -674,38 +741,30 @@ class VAPTScanner:
             return None
     
     def heartbleed_test(self, hostname):
-        """Basic Heartbleed detection (CVE-2014-0160)"""
-        print(f"\n[*] Testing for Heartbleed (CVE-2014-0160)")
+        """TLS posture check (Heartbleed context).
+
+        IMPORTANT: This does NOT send a real heartbeat probe, and
+        ssl.OPENSSL_VERSION reflects the *client's* local OpenSSL, not the
+        server's. It therefore CANNOT confirm Heartbleed (CVE-2014-0160) on
+        the target. It only reports the negotiated protocol and flags
+        deprecated versions. Use a dedicated tool for real Heartbleed testing.
+        """
+        print(f"\n[*] Checking TLS posture (Heartbleed context, CVE-2014-0160)")
         try:
             context = ssl.create_default_context()
             with socket.create_connection((hostname, 443), timeout=5) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                     version = ssock.version()
-                    # Heartbleed affects OpenSSL 1.0.1 through 1.0.1f
-                    # Modern TLS libraries are patched; check protocol and cipher info
-                    openssl_version = ssl.OPENSSL_VERSION
-                    
                     print(f"[+] TLS Version: {version}")
-                    print(f"[+] OpenSSL: {openssl_version}")
-                    
-                    # Parse OpenSSL version to check if vulnerable
-                    # Vulnerable: OpenSSL 1.0.1 through 1.0.1f
-                    match = re.search(r'OpenSSL (\d+\.\d+\.\d+)([a-z]?)', openssl_version)
-                    if match:
-                        ver = match.group(1)
-                        patch = match.group(2)
-                        if ver == '1.0.1' and patch in ('', 'a', 'b', 'c', 'd', 'e', 'f'):
-                            print(f"[!] Vulnerable OpenSSL version: {openssl_version}")
-                            self._record('heartbleed_test', {'vulnerable': True, 'openssl': openssl_version})
-                            return True
-                    
-                    # Also flag deprecated protocols as a risk indicator
-                    if version in ['TLSv1', 'TLSv1.1']:
-                        print(f"[!] Deprecated protocol {version} in use (not Heartbleed, but insecure)")
-                        self._record('heartbleed_test', {'vulnerable': False, 'deprecated_protocol': version})
+                    print("[*] Note: server-side Heartbleed cannot be confirmed by this check")
+
+                    if version in ['TLSv1', 'TLSv1.1', 'SSLv3', 'SSLv2']:
+                        print(f"[!] Deprecated protocol {version} in use (insecure, not Heartbleed)")
+                        self._record('heartbleed_test', {'vulnerable': None, 'deprecated_protocol': version})
                         return False
-                    
-                    print(f"[+] Not vulnerable to Heartbleed")
+
+                    print(f"[+] No deprecated TLS protocol detected")
+                    self._record('heartbleed_test', {'vulnerable': None, 'protocol': version})
                     return False
         except Exception as e:
             print(f"[!] Error: {e}")
@@ -748,10 +807,13 @@ class VAPTScanner:
                 return True
             
         except socket.timeout:
-            # Timeout can indicate the server is holding the connection waiting for chunked data
-            print("[!] Server timeout may indicate request smuggling susceptibility")
-            return True
-        except Exception as e:
+            # A timeout alone is NOT reliable evidence of smuggling: normal
+            # servers frequently time out on partial/chunked requests. Report
+            # as inconclusive rather than vulnerable to avoid false positives.
+            print("[-] No response (timeout) - inconclusive, not flagged as vulnerable")
+            self._record('http_request_smuggling', {'result': 'inconclusive_timeout'})
+            return False
+        except Exception:
             pass
         
         print("[+] No request smuggling detected")
@@ -1109,12 +1171,20 @@ class VAPTScanner:
             findings = []
             for pattern, desc in weak_patterns:
                 matches = re.findall(pattern, content)
-                if matches:
-                    # Filter out common false positives (UUIDs with dashes removed, CSS colors, etc.)
-                    real_matches = [m for m in matches if not re.match(r'^[0-9a-f]{8}[0-9a-f]{4}[0-9a-f]{4}[0-9a-f]{4}[0-9a-f]{12}$', m.strip())]
-                    if real_matches:
-                        print(f"[!] Possible {desc} detected in response ({len(real_matches)} occurrence(s))")
-                        findings.append(desc)
+                if not matches:
+                    continue
+                # The \b boundaries in the MD5/SHA1 patterns already exclude
+                # dashed UUIDs (which contain '-'). Exclude 32-hex values that
+                # appear inside a full dashed-UUID context to cut false positives.
+                uuid_context = set(re.findall(
+                    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                    content,
+                ))
+                joined_uuids = ''.join(u.replace('-', '') for u in uuid_context)
+                real_matches = [m for m in matches if m not in joined_uuids]
+                if real_matches:
+                    print(f"[!] Possible {desc} detected in response ({len(real_matches)} occurrence(s))")
+                    findings.append(desc)
             
             if findings:
                 self._record('weak_crypto_check', {'findings': findings})
@@ -1561,7 +1631,6 @@ class VAPTScanner:
             ('<%= 7*7 %>', '49'),
             ('#{7*7}', '49'),
             ('{{7*\'7\'}}', '7777777'),
-            ('${7*7}', '49'),
         ]
 
         for payload, expected in payloads:
@@ -1841,6 +1910,17 @@ class VAPTScanner:
         print("[+] No race condition detected")
         return False
 
+def _summarize(value):
+    """Normalize a test return value into a JSON-friendly summary."""
+    if isinstance(value, bool):
+        return {'vulnerable': value}
+    if isinstance(value, list):
+        return {'found': value, 'count': len(value)}
+    if value is None:
+        return {'result': 'error_or_skipped'}
+    return {'result': value}
+
+
 def main():
     parser = argparse.ArgumentParser(description='VAPT Scanner - Educational Use Only')
     parser.add_argument('-t', '--target', required=True, help='Target IP or domain')
@@ -1851,6 +1931,10 @@ def main():
     parser.add_argument('-d', '--subdomain', action='store_true', help='Enumerate subdomains')
     parser.add_argument('-a', '--all', action='store_true', help='Run all tests')
     parser.add_argument('-o', '--output', help='Output JSON report to file')
+    parser.add_argument('--delay', type=float, default=0.0,
+                        help='Delay in seconds between HTTP requests (politeness/rate control)')
+    parser.add_argument('--confirm-authorized', action='store_true',
+                        help='Confirm you are authorized to test the target (required to run)')
     
     args = parser.parse_args()
     
@@ -1858,77 +1942,100 @@ def main():
     print("VAPT Scanner - Vulnerability Assessment Tool")
     print("Educational/Authorized Use Only")
     print("="*60)
-    
-    scanner = VAPTScanner(args.target)
-    
+
+    # Authorization gate: refuse to run active tests without acknowledgment.
+    if not args.confirm_authorized:
+        print("\n[!] You must confirm you are authorized to test this target.")
+        print("[!] Only test systems you own or have explicit written permission to test.")
+        print("[!] Re-run with --confirm-authorized to proceed.")
+        return 2
+
+    scanner = VAPTScanner(args.target, delay=args.delay)
+
+    def run(name, func, *fargs):
+        """Run a test and capture its result into scanner.results.
+
+        Preserves any richer detail a test recorded via _record(); otherwise
+        stores a normalized summary of the return value so the JSON report
+        reflects every executed test.
+        """
+        result = func(*fargs)
+        if name not in scanner.results:
+            scanner._record(name, _summarize(result))
+        return result
+
     if args.all or args.ports:
-        scanner.port_scan()
+        run('port_scan', scanner.port_scan)
     
     if args.all or args.ssl:
-        scanner.ssl_check(args.target)
-        scanner.weak_cipher_check(args.target)
-        scanner.heartbleed_test(args.target)
+        run('ssl_check', scanner.ssl_check, args.target)
+        run('weak_cipher_check', scanner.weak_cipher_check, args.target)
+        run('heartbleed_test', scanner.heartbleed_test, args.target)
     
     if args.all or args.subdomain:
-        scanner.subdomain_enum(args.target)
-        scanner.subdomain_takeover_check(args.target)
-        scanner.dns_zone_transfer(args.target)
+        run('subdomain_enum', scanner.subdomain_enum, args.target)
+        run('subdomain_takeover_check', scanner.subdomain_takeover_check, args.target)
+        run('dns_zone_transfer', scanner.dns_zone_transfer, args.target)
     
     if args.url and (args.all or args.web):
-        scanner.http_header_check(args.url)
-        scanner.version_disclosure_check(args.url)
-        scanner.cms_detection(args.url)
-        scanner.robots_check(args.url)
-        scanner.security_txt_check(args.url)
-        scanner.sql_injection_test(args.url)
-        scanner.nosql_injection_test(args.url)
-        scanner.ldap_injection_test(args.url)
-        scanner.xss_test(args.url)
-        scanner.lfi_test(args.url)
-        scanner.rfi_test(args.url)
-        scanner.path_traversal_test(args.url)
-        scanner.xxe_test(args.url)
-        scanner.xml_bomb_test(args.url)
-        scanner.ssrf_test(args.url)
-        scanner.ssti_test(args.url)
-        scanner.command_injection_test(args.url)
-        scanner.email_injection_test(args.url)
-        scanner.crlf_injection_test(args.url)
-        scanner.shellshock_test(args.url)
-        scanner.cors_check(args.url)
-        scanner.clickjacking_test(args.url)
-        scanner.open_redirect_test(args.url)
-        scanner.jwt_test(args.url)
-        scanner.http_methods_test(args.url)
-        scanner.cookie_security_check(args.url)
-        scanner.deserialization_test(args.url)
-        scanner.hpp_test(args.url)
-        scanner.host_header_injection_test(args.url)
-        scanner.cache_poisoning_test(args.url)
-        scanner.http_request_smuggling(args.url)
-        scanner.http_response_splitting(args.url)
-        scanner.content_type_confusion(args.url)
-        scanner.graphql_introspection(args.url)
-        scanner.websocket_test(args.url)
-        scanner.oauth_misconfiguration_test(args.url)
-        scanner.rate_limiting_check(args.url)
-        scanner.idor_test(args.url)
-        scanner.ssi_injection_test(args.url)
-        scanner.xpath_injection_test(args.url)
-        scanner.ip_spoofing_test(args.url)
-        scanner.weak_crypto_check(args.url)
-        scanner.session_fixation_test(args.url)
-        scanner.mixed_content_check(args.url)
-        scanner.file_upload_test(args.url)
-        scanner.api_auth_bypass_test(args.url)
-        scanner.timing_attack_test(args.url)
-        scanner.prototype_pollution_test(args.url)
-        scanner.mass_assignment_test(args.url)
-        scanner.info_disclosure(args.url)
-        scanner.api_endpoint_scan(args.url)
-        scanner.backup_file_scan(args.url)
-        scanner.directory_scan(args.url)
-        scanner.race_condition_test(args.url)
+        web_tests = [
+            ('http_header_check', scanner.http_header_check),
+            ('version_disclosure_check', scanner.version_disclosure_check),
+            ('cms_detection', scanner.cms_detection),
+            ('robots_check', scanner.robots_check),
+            ('security_txt_check', scanner.security_txt_check),
+            ('sql_injection_test', scanner.sql_injection_test),
+            ('nosql_injection_test', scanner.nosql_injection_test),
+            ('ldap_injection_test', scanner.ldap_injection_test),
+            ('xss_test', scanner.xss_test),
+            ('lfi_test', scanner.lfi_test),
+            ('rfi_test', scanner.rfi_test),
+            ('path_traversal_test', scanner.path_traversal_test),
+            ('xxe_test', scanner.xxe_test),
+            ('xml_bomb_test', scanner.xml_bomb_test),
+            ('ssrf_test', scanner.ssrf_test),
+            ('ssti_test', scanner.ssti_test),
+            ('command_injection_test', scanner.command_injection_test),
+            ('email_injection_test', scanner.email_injection_test),
+            ('crlf_injection_test', scanner.crlf_injection_test),
+            ('shellshock_test', scanner.shellshock_test),
+            ('cors_check', scanner.cors_check),
+            ('clickjacking_test', scanner.clickjacking_test),
+            ('open_redirect_test', scanner.open_redirect_test),
+            ('jwt_test', scanner.jwt_test),
+            ('http_methods_test', scanner.http_methods_test),
+            ('cookie_security_check', scanner.cookie_security_check),
+            ('deserialization_test', scanner.deserialization_test),
+            ('hpp_test', scanner.hpp_test),
+            ('host_header_injection_test', scanner.host_header_injection_test),
+            ('cache_poisoning_test', scanner.cache_poisoning_test),
+            ('http_request_smuggling', scanner.http_request_smuggling),
+            ('http_response_splitting', scanner.http_response_splitting),
+            ('content_type_confusion', scanner.content_type_confusion),
+            ('graphql_introspection', scanner.graphql_introspection),
+            ('websocket_test', scanner.websocket_test),
+            ('oauth_misconfiguration_test', scanner.oauth_misconfiguration_test),
+            ('rate_limiting_check', scanner.rate_limiting_check),
+            ('idor_test', scanner.idor_test),
+            ('ssi_injection_test', scanner.ssi_injection_test),
+            ('xpath_injection_test', scanner.xpath_injection_test),
+            ('ip_spoofing_test', scanner.ip_spoofing_test),
+            ('weak_crypto_check', scanner.weak_crypto_check),
+            ('session_fixation_test', scanner.session_fixation_test),
+            ('mixed_content_check', scanner.mixed_content_check),
+            ('file_upload_test', scanner.file_upload_test),
+            ('api_auth_bypass_test', scanner.api_auth_bypass_test),
+            ('timing_attack_test', scanner.timing_attack_test),
+            ('prototype_pollution_test', scanner.prototype_pollution_test),
+            ('mass_assignment_test', scanner.mass_assignment_test),
+            ('info_disclosure', scanner.info_disclosure),
+            ('api_endpoint_scan', scanner.api_endpoint_scan),
+            ('backup_file_scan', scanner.backup_file_scan),
+            ('directory_scan', scanner.directory_scan),
+            ('race_condition_test', scanner.race_condition_test),
+        ]
+        for name, func in web_tests:
+            run(name, func, args.url)
     
     print("\n[*] Scan complete")
 
@@ -1946,6 +2053,7 @@ def main():
         with open(args.output, 'w') as f:
             json.dump(report, f, indent=2, default=str)
         print(f"[*] JSON report saved to: {args.output}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
