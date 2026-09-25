@@ -771,11 +771,20 @@ class VAPTScanner:
             return None
     
     def http_request_smuggling(self, url):
-        """Test for HTTP request smuggling"""
+        """Test for HTTP request smuggling (plaintext HTTP only)."""
         print(f"\n[*] Testing for HTTP request smuggling")
         
         parsed = urlparse(url)
         host = parsed.hostname
+        scheme = parsed.scheme.lower()
+
+        # This raw-socket probe speaks plaintext HTTP. For HTTPS targets a raw
+        # socket would send cleartext to the TLS port and never work, so skip.
+        if scheme == 'https':
+            print("[-] Skipping: raw-socket smuggling probe does not support HTTPS")
+            self._record('http_request_smuggling', {'result': 'skipped_https'})
+            return False
+
         port = parsed.port or 80
         
         # CL.TE probe: send conflicting Content-Length and Transfer-Encoding
@@ -858,8 +867,11 @@ class VAPTScanner:
             print("[+] Server handled XML bomb safely")
             return False
         except requests.exceptions.Timeout:
-            print("[!] Server timeout - possible XML bomb vulnerability")
-            return True
+            # A timeout alone is weak evidence: any slow endpoint triggers it.
+            # Report as inconclusive rather than a confirmed vulnerability.
+            print("[-] Server timeout - inconclusive (not flagged as vulnerable)")
+            self._record('xml_bomb_test', {'result': 'inconclusive_timeout'})
+            return False
         except Exception as e:
             print("[+] No XML bomb vulnerability")
             return False
@@ -1868,11 +1880,16 @@ class VAPTScanner:
         results = []
         num_threads = 10
 
-        def make_request(url):
+        def make_request(target_url):
+            # requests.Session is not guaranteed thread-safe, so each worker
+            # uses its own short-lived session to avoid connection-pool races.
             try:
-                resp = self.session.get(url, timeout=5)
-                return resp.status_code, len(resp.content), resp.text[:100]
-            except Exception as e:
+                with requests.Session() as s:
+                    s.verify = False
+                    s.headers.update({'User-Agent': 'VAPT-Scanner/1.0'})
+                    resp = s.get(target_url, timeout=5)
+                    return resp.status_code, len(resp.content), resp.text[:100]
+            except requests.RequestException as e:
                 return None, None, str(e)
 
         try:
